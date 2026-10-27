@@ -1,0 +1,94 @@
+# Archipelago-only (never upstreamed): build rdfm-server and rdfm-frontend from
+# the `archipelago` branch and push them to our ACR, tagged with the commit.
+# Deployment repo: ArchipelagoMarineResearch/rdfm-iac (docs/rdfm-fork.md).
+name: build-images
+
+on:
+  push:
+    branches: [archipelago]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: build-images-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ACR: rdfmprodamr.azurecr.io
+  RDFM_URL: https://rdfm.archipelago.ca
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    # The push identity only trusts this branch.
+    if: github.ref == 'refs/heads/archipelago'
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Image tag
+        run: echo "TAG=${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_ACR_PUSH_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          allow-no-subscriptions: true
+
+      # Token exchange instead of `az acr login`, which also needs read access
+      # to the registry resource; AcrPush alone covers this.
+      - name: Log in to ACR
+        env:
+          TENANT: ${{ vars.AZURE_TENANT_ID }}
+        run: |
+          aad=$(az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$aad"
+          refresh=$(curl -sfS --retry 3 \
+            --data-urlencode grant_type=access_token \
+            --data-urlencode "service=$ACR" \
+            --data-urlencode "tenant=$TENANT" \
+            --data-urlencode "access_token=$aad" \
+            "https://$ACR/oauth2/exchange" | jq -er .refresh_token)
+          echo "::add-mask::$refresh"
+          docker login "$ACR" -u 00000000-0000-0000-0000-000000000000 --password-stdin <<<"$refresh"
+
+      - name: Build rdfm-server
+        run: |
+          docker build -f server/deploy/Dockerfile \
+            --label org.opencontainers.image.source="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            -t "$ACR/rdfm-server:$TAG" .
+
+      # The frontend bakes its URLs in at build time. Upstream's builder writes
+      # the compiled site to /static; we pack that into a minimal image the
+      # deploy step copies the files out of.
+      - name: Build rdfm-frontend
+        run: |
+          docker build -f frontend/Dockerfile -t rdfm-frontend-builder .
+          mkdir -p frontend-dist
+          docker run --rm \
+            -e VITE_RDFM_BACKEND=false \
+            -e VITE_LOGIN_URL="$RDFM_URL/kc/realms/rdfm/protocol/openid-connect/auth" \
+            -e VITE_LOGOUT_URL="$RDFM_URL/kc/realms/rdfm/protocol/openid-connect/logout" \
+            -e VITE_OAUTH2_CLIENT=rdfm-server-introspection \
+            -v "$PWD/frontend-dist:/static" \
+            rdfm-frontend-builder
+          test -f frontend-dist/index.html
+          printf 'FROM scratch\nCOPY . /static/\n' > frontend.Dockerfile
+          docker build -f frontend.Dockerfile \
+            --label org.opencontainers.image.source="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            -t "$ACR/rdfm-frontend:$TAG" frontend-dist
+
+      - name: Push
+        run: |
+          docker push "$ACR/rdfm-server:$TAG"
+          docker push "$ACR/rdfm-frontend:$TAG"
+          {
+            echo "### Images"
+            echo "- \`$ACR/rdfm-server:$TAG\`"
+            echo "- \`$ACR/rdfm-frontend:$TAG\`"
+          } >> "$GITHUB_STEP_SUMMARY"
